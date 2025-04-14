@@ -1,0 +1,193 @@
+import sys
+import math
+import bs4 as bs
+import urllib.request
+import re
+from PyPDF2 import PdfReader  # Updated import
+import nltk
+from nltk.stem import WordNetLemmatizer 
+import spacy
+import requests
+import json
+
+# Initialize variables
+nlp = spacy.load('en_core_web_sm')
+lemmatizer = WordNetLemmatizer() 
+
+# OCR.space API functions
+def ocr_space_file(filename, overlay=False, api_key='YOUR_API_KEY', language='eng'):
+    """ OCR.space API request with local file """
+    payload = {
+        'isOverlayRequired': overlay,
+        'apikey': api_key,
+        'language': language,
+    }
+    with open(filename, 'rb') as f:
+        response = requests.post(
+            'https://api.ocr.space/parse/image',
+            files={filename: f},
+            data=payload,
+        )
+    return response.json()
+
+def ocr_space_url(url, overlay=False, api_key='YOUR_API_KEY', language='eng'):
+    """ OCR.space API request with image URL """
+    payload = {
+        'url': url,
+        'isOverlayRequired': overlay,
+        'apikey': api_key,
+        'language': language,
+    }
+    response = requests.post('https://api.ocr.space/parse/imageurl', data=payload)
+    return response.json()
+
+def extract_text_from_image(image_path, api_key='K83639167288957'):
+    """ Unified function for both local and remote images """
+    try:
+        if image_path.startswith(('http://', 'https://')):
+            result = ocr_space_url(image_path, api_key=api_key)
+        else:
+            result = ocr_space_file(image_path, api_key=api_key)
+        
+        if result['IsErroredOnProcessing']:
+            print("OCR Error:", result['ErrorMessage'])
+            return ""
+        return result['ParsedResults'][0]['ParsedText']
+    except Exception as e:
+        print(f"OCR Processing Failed: {str(e)}")
+        return ""
+
+# Text input functions
+def read_text_file(filepath):
+    with open(filepath) as f:
+        return f.read().replace("\n", '')
+
+def read_pdf_file(pdf_path):
+    text = ""
+    with open(pdf_path, 'rb') as pdf_file:
+        pdf_reader = PdfReader(pdf_file)  # Updated to use PdfReader
+        count = len(pdf_reader.pages)  # Updated property name
+        print("\nTotal Pages in PDF:", count)
+        
+        c = input("Read entire PDF? [Y]/N: ").strip().upper() or 'Y'
+        start_page, end_page = 0, count-1
+        
+        if c == 'N':
+            start_page = int(input(f"Start page (0-{count-1}): "))
+            end_page = int(input(f"End page ({start_page}-{count-1}): "))
+            
+            if not (0 <= start_page <= end_page < count):
+                print("Invalid page range")
+                sys.exit()
+                
+        for i in range(start_page, end_page+1):
+            text += pdf_reader.pages[i].extract_text()  # Updated method
+    return text
+
+def read_wikipedia_page(url):
+    scraped_data = urllib.request.urlopen(url)
+    article = scraped_data.read()
+    parsed_article = bs.BeautifulSoup(article, 'lxml')
+    return ' '.join(p.text for p in parsed_article.find_all('p'))
+
+# TF-IDF functions
+def create_frequency_matrix(sentences):
+    freq_matrix = {}
+    stop_words = nlp.Defaults.stop_words
+
+    for sent in sentences:
+        freq_table = {}
+        words = [word.text.lower() for word in sent if word.text.isalnum()]
+       
+        for word in words:
+            lemma = lemmatizer.lemmatize(word)
+            if lemma not in stop_words:
+                freq_table[lemma] = freq_table.get(lemma, 0) + 1
+
+        freq_matrix[sent[:15]] = freq_table
+    return freq_matrix
+
+def calculate_tf_matrix(freq_matrix):
+    tf_matrix = {}
+    for sent, freq_table in freq_matrix.items():
+        total_words = len(freq_table)
+        tf_matrix[sent] = {word: count/total_words for word, count in freq_table.items()}
+    return tf_matrix
+
+def count_sentences_per_word(freq_matrix):
+    word_counts = {}
+    for f_table in freq_matrix.values():
+        for word in f_table:
+            word_counts[word] = word_counts.get(word, 0) + 1
+    return word_counts
+
+def calculate_idf_matrix(freq_matrix, word_counts, total_sentences):
+    idf_matrix = {}
+    for sent, f_table in freq_matrix.items():
+        idf_matrix[sent] = {word: math.log10(total_sentences/word_counts[word]) 
+                           for word in f_table}
+    return idf_matrix
+
+def calculate_tfidf_matrix(tf_matrix, idf_matrix):
+    tfidf_matrix = {}
+    for sent in tf_matrix:
+        tfidf_matrix[sent] = {word: tf_matrix[sent][word] * idf_matrix[sent][word]
+                             for word in tf_matrix[sent]}
+    return tfidf_matrix
+
+def score_sentences(tfidf_matrix):
+    return {sent: sum(scores.values())/len(scores) 
+           for sent, scores in tfidf_matrix.items() if len(scores) > 0}
+
+def generate_summary(sentences, sentence_scores, threshold):
+    return ' '.join(sent.text for sent in sentences 
+                   if sent[:15] in sentence_scores 
+                   and sentence_scores[sent[:15]] >= threshold)
+
+# Main execution
+def main():
+    input_text_type = int(input("Select input method:\n"
+                              "1. Direct text\n2. Text file\n3. PDF file\n"
+                              "4. Wikipedia URL\n5. Image (OCR)\nChoice: "))
+    
+    if input_text_type == 1:
+        text = input("Enter text:\n")
+    elif input_text_type == 2:
+        text = read_text_file(input("Text file path: "))
+    elif input_text_type == 3:
+        text = read_pdf_file(input("PDF file path: "))
+    elif input_text_type == 4:
+        text = read_wikipedia_page(input("Wikipedia URL: "))
+    elif input_text_type == 5:
+        text = extract_text_from_image(input("Image path/URL: "))
+        print("\nExtracted Text:\n", text, "\n" + "="*50)
+    else:
+        print("Invalid choice")
+        sys.exit()
+    
+    if not text.strip():
+        print("Error: No text to summarize")
+        sys.exit()
+    
+    # Process text
+    doc = nlp(text)
+    sentences = list(doc.sents)
+    
+    # Generate summary
+    freq_matrix = create_frequency_matrix(sentences)
+    tf_matrix = calculate_tf_matrix(freq_matrix)
+    word_counts = count_sentences_per_word(freq_matrix)
+    idf_matrix = calculate_idf_matrix(freq_matrix, word_counts, len(sentences))
+    tfidf_matrix = calculate_tfidf_matrix(tf_matrix, idf_matrix)
+    sentence_scores = score_sentences(tfidf_matrix)
+    threshold = (sum(sentence_scores.values())/len(sentence_scores)) * 1.3 if sentence_scores else 0
+    summary = generate_summary(sentences, sentence_scores, threshold)
+    
+    # Output results
+    print("\n" + "*"*20, "Summary", "*"*20)
+    print(summary)
+    print("\nOriginal words:", len([t for t in doc if t.is_alpha]))
+    print("Summary words:", len(summary.split()))
+
+if __name__ == "__main__":
+    main()
